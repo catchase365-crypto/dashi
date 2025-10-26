@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>请教大师</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', 'Noto Sans SC', sans-serif; -webkit-font-smoothing: antialiased; overscroll-behavior: none; }
+        .chat-bubble { max-width: 90%; word-wrap: break-word; position: relative; }
+        /* 用户的消息气泡 */
+        .chat-bubble.user { 
+            background-color: #3b82f6; 
+            align-self: flex-end; 
+            padding: 0.75rem 1.25rem; 
+            border-radius: 1.25rem;
+            text-align: left;
+        }
+        /* 大师的消息气泡 */
+        .chat-bubble.model { 
+            background-color: #374151; 
+            align-self: flex-start; 
+            padding: 0.75rem 1.25rem; 
+            border-radius: 1.25rem; 
+        }
+        /* 滚动条样式 */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #1f2937; }
+        ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
+        /* 侧边栏过渡 */
+        #sidebar { transition: transform 0.3s ease-in-out; }
+        .context-menu { position: absolute; z-index: 100; display: none; }
+
+        /* 反问按钮的样式 */
+        .follow-up-btn {
+            background-color: #4b5563; /* 灰色 */
+            border: 1px solid #6b7280;
+            padding: 0.5rem 1rem;
+            border-radius: 1rem;
+            text-align: left;
+            transition: background-color 0.2s;
+        }
+        .follow-up-btn:hover {
+            background-color: #525f73;
+        }
+        .follow-up-btn:disabled {
+            opacity: 0.5;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-gray-200 flex items-center justify-center h-screen overflow-hidden">
+
+    <!-- 侧边栏 (历史记录) -->
+    <aside id="sidebar" class="absolute top-0 left-0 h-full w-64 bg-gray-900 border-r border-gray-700 z-40 transform -translate-x-full flex flex-col"></aside>
+    <div id="sidebar-overlay" class="hidden fixed inset-0 bg-black bg-opacity-50 z-30"></div>
+
+    <!-- 主应用容器 -->
+    <div id="app-container" class="w-full max-w-3xl h-screen md:h-[95vh] md:rounded-2xl flex flex-col bg-gray-800 shadow-2xl overflow-hidden">
+        <main id="main-content" class="flex flex-1 flex-col h-full"></main>
+    </div>
+
+    <!-- 设置 Modals -->
+    <div id="settings-modal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"></div>
+    <div id="topic-modal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"></div>
+
+<script>
+    // --- 状态管理 ---
+    let isLoading = false;
+    let apiKey = '';
+    let currentTopic = '综合知识';
+    let allHistories = {}; // 存储所有对话历史
+    let currentFollowUps = []; // 当前可用的反问
+
+    // --- DOM 元素 ---
+    const mainContent = document.getElementById('main-content');
+    const sidebar = document.getElementById('sidebar');
+    const sidebarOverlay = document.getElementById('sidebar-overlay');
+    const settingsModal = document.getElementById('settings-modal');
+    const topicModal = document.getElementById('topic-modal');
+
+    // --- AI 配置 (已更新) ---
+    const BASE_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=';
+    
+    // 新的 JSON Schema
+    const generationConfig = { 
+        responseMimeType: "application/json", 
+        responseSchema: { 
+            type: "OBJECT", 
+            properties: { 
+                response_text: { type: "STRING" }, 
+                follow_up_prompts: { 
+                    type: "ARRAY", 
+                    items: { type: "STRING" } 
+                } 
+            }, 
+            required: ["response_text", "follow_up_prompts"] 
+        } 
+    };
+    
+    // --- 辅助函数 ---
+    function openSettingsModal() { settingsModal.classList.remove('hidden'); document.getElementById('api-key-input').value = apiKey; }
+    function closeSettingsModal() { settingsModal.classList.add('hidden'); }
+    function openTopicModal() { topicModal.classList.remove('hidden'); document.getElementById('topic-input').value = currentTopic; }
+    function closeTopicModal() { topicModal.classList.add('hidden'); }
+    function toggleSidebar() { sidebar.classList.toggle('-translate-x-full'); sidebarOverlay.classList.toggle('hidden'); }
+
+    function saveApiKey() { 
+        const newKey = document.getElementById('api-key-input').value.trim(); 
+        if (newKey) { 
+            apiKey = newKey; 
+            localStorage.setItem('geminiApiKey', newKey); 
+            closeSettingsModal(); 
+            // 如果当前对话为空，自动开始
+            if (!allHistories[currentTopic] || allHistories[currentTopic].history.length === 0) {
+                 switchTopic(currentTopic, true);
+            } 
+        } else { 
+            // 不使用 alert
+            console.warn('请输入有效的 API Key。');
+        } 
+    }
+
+    function saveTopicAndStart() { 
+        const newTopic = document.getElementById('topic-input').value.trim(); 
+        if (newTopic) { 
+            closeTopicModal(); 
+            switchTopic(newTopic, !allHistories[newTopic]); 
+        } else { 
+            console.warn('请输入有效的主题关键词。');
+        } 
+    }
+    
+    // --- 初始化 ---
+    document.addEventListener('DOMContentLoaded', initializeApp);
+
+    function initializeApp() {
+        renderModals();
+        renderSidebar();
+        loadAllHistories();
+        renderHistoryList();
+        const lastTopic = localStorage.getItem('masterLastTopic') || '量子力学';
+        switchTopic(lastTopic);
+        if (!loadApiKey()) openSettingsModal();
+        setupGlobalEventListeners();
+    }
+
+    function setupGlobalEventListeners() {
+        sidebarOverlay.addEventListener('click', toggleSidebar);
+        // 全局点击，用于关闭右键菜单
+        document.body.addEventListener('click', (e) => {
+            if (!e.target.closest('.context-menu-parent')) closeContextMenu();
+        });
+        // 移除旧的键盘快捷键
+    }
+
+    // --- 核心渲染函数 ---
+    function renderChatInterface() {
+        currentMode = 'chat'; // 模式改为 'chat'
+        mainContent.innerHTML = `
+            <header class="bg-gray-900/50 backdrop-blur-sm p-4 border-b border-gray-700 flex items-center justify-between flex-shrink-0">
+                <button id="sidebar-toggle-btn" title="打开历史" class="text-gray-400 hover:text-white transition"><svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h16" /></svg></button>
+                <h2 id="topic-title" class="text-xl font-bold text-white truncate px-2"></h2>
+                <div class="flex items-center space-x-4">
+                    <button id="topic-btn" title="设置主题" class="text-gray-400 hover:text-white transition"><svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg></button>
+                    <button id="settings-btn" title="设置API" class="text-gray-400 hover:text-white transition"><svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg></button>
+                    <button id="restart-btn" class="text-sm text-gray-400 hover:text-white transition">新对话</button>
+                </div>
+            </header>
+            <main id="chat-messages" class="flex-1 p-6 overflow-y-auto flex flex-col space-y-4"></main>
+            <div id="loading-spinner" class="hidden p-6 flex items-center justify-center flex-shrink-0"><div class="flex items-center space-x-2 text-gray-400"><svg class="h-6 w-6 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg><span>大师正在思考...</span></div></div>
+            <footer class="p-4 border-t border-gray-700 bg-gray-800 flex-shrink-0">
+                <div id="options-container" class="flex flex-col space-y-3"></div>
+            </footer>
+        `;
+        // 绑定新事件
+        document.getElementById('restart-btn').addEventListener('click', () => switchTopic(currentTopic, true));
+        document.getElementById('settings-btn').addEventListener('click', openSettingsModal);
+        document.getElementById('topic-btn').addEventListener('click', openTopicModal);
+        document.getElementById('sidebar-toggle-btn').addEventListener('click', toggleSidebar);
+        
+        // 委托事件监听器
+        document.getElementById('options-container').addEventListener('click', (e) => {
+            const button = e.target.closest('.follow-up-btn');
+            if (button && !isLoading) {
+                handleFollowUpClick(button.dataset.prompt);
+            }
+        });
+        
+        document.getElementById('topic-title').textContent = currentTopic;
+    }
+
+    function renderModals() {
+        // 设置 Modal
+        settingsModal.innerHTML = `<div class="bg-gray-800 rounded-2xl p-8 w-full max-w-md shadow-2xl border border-gray-700"><h2 class="text-2xl font-bold mb-4 text-white">设置 API 密钥</h2><p class="text-gray-400 mb-6">请输入您的 Google Gemini API 密钥。</p><label for="api-key-input" class="block text-sm font-medium text-gray-300 mb-2">API KEY:</label><input type="password" id="api-key-input" class="w-full p-3 bg-gray-700 border border-gray-600 rounded-lg text-gray-200 focus:ring-2 focus:ring-blue-500"><div class="mt-6 flex justify-end space-x-4"><button id="cancel-settings-btn" class="py-2 px-5 bg-gray-600 hover:bg-gray-500 rounded-lg transition">取消</button><button id="save-settings-btn" class="py-2 px-5 bg-blue-600 hover:bg-blue-700 rounded-lg transition">保存</button></div></div>`;
+        
+        // 主题 Modal (更新文案)
+        topicModal.innerHTML = `<div class="bg-gray-800 rounded-2xl p-8 w-full max-w-md shadow-2xl border border-gray-700"><h2 class="text-2xl font-bold mb-4 text-white">设置请教主题</h2><p class="text-gray-400 mb-6">请输入您想请教的主题，例如 "量子力学"。</p><label for="topic-input" class="block text-sm font-medium text-gray-300 mb-2">主题关键词:</label><input type="text" id="topic-input" class="w-full p-3 bg-gray-700 border border-gray-600 rounded-lg text-gray-200 focus:ring-2 focus:ring-blue-500"><div class="mt-6 flex justify-end space-x-4"><button id="cancel-topic-btn" class="py-2 px-5 bg-gray-600 hover:bg-gray-500 rounded-lg transition">取消</button><button id="save-topic-btn" class="py-2 px-5 bg-blue-600 hover:bg-blue-700 rounded-lg transition">开始请教</button></div></div>`;
+        
+        // 绑定 Modal 事件
+        document.getElementById('cancel-settings-btn').addEventListener('click', closeSettingsModal);
+        document.getElementById('save-settings-btn').addEventListener('click', saveApiKey);
+        document.getElementById('cancel-topic-btn').addEventListener('click', closeTopicModal);
+        document.getElementById('save-topic-btn').addEventListener('click', saveTopicAndStart);
+    }
+    
+    // 侧边栏 (移除错题相关)
+    function renderSidebar() {
+        sidebar.innerHTML = `
+            <div class="p-4 border-b border-gray-700">
+                <h3 class="text-lg font-bold text-white">对话历史</h3>
+            </div>
+            <nav id="history-list" class="flex-1 overflow-y-auto p-2"></nav>
+            <div class="p-4 border-t border-gray-700">
+                <button id="clear-history-btn" class="w-full text-sm text-red-400 hover:text-red-300 bg-red-900/50 hover:bg-red-900/80 py-2 rounded-lg transition-colors">清除所有记录</button>
+            </div>
+        `;
+        document.getElementById('clear-history-btn').addEventListener('click', clearAllHistory);
+    }
+    
+    // --- 核心 API 调用 (已重写) ---
+    async function fetchMasterResponse(promptText) {
+        if (!apiKey) { 
+            openSettingsModal(); 
+            return; 
+        }
+        setLoading(true);
+        
+        // 构建大师的 Prompt
+        const systemPrompt = `你是一位博学多识的“大师”。你的任务是：
+1.  始终扮演“大师”的角色，用简洁、深刻、启发性的语言回答用户的问题。
+2.  你的回答 (response_text) 不应过长，保持在1-3个段落内。
+3.  在回答的最后，你必须提供 3 到 4 个高质量的、引导性的“反问” (follow_up_prompts)，这些问题能帮助用户更深入地探索相关主题。
+4.  你的回复必须严格遵循指定的JSON格式。`;
+        
+        const userMessage = promptText;
+        
+        const payload = { 
+            contents: [{ role: 'user', parts: [{ text: userMessage }] }], 
+            systemInstruction: { parts: [{ text: systemPrompt }] }, 
+            generationConfig 
+        };
+        
+        try {
+            const response = await fetch(BASE_API_URL + apiKey, { 
+                method: 'POST', 
+                headers: { 'Content-Type': 'application/json' }, 
+                body: JSON.stringify(payload) 
+            });
+            
+            if (!response.ok) { 
+                const errorBody = await response.json(); 
+                throw new Error(`API 请求失败: ${errorBody.error.message}`); 
+            }
+            
+            const result = await response.json();
+            const candidate = result.candidates?.[0];
+            
+            if (!candidate?.content?.parts?.[0]?.text) {
+                throw new Error("返回的数据结构无效。");
+            }
+            
+            const rawText = candidate.content.parts[0].text;
+            
+            try {
+                // 清理可能的 markdown 标记
+                const cleanedText = rawText.trim().replace(/```json|```/g, '').trim();
+                const jsonResponse = JSON.parse(cleanedText);
+                
+                if (!jsonResponse.response_text || !jsonResponse.follow_up_prompts) {
+                    throw new Error("返回的JSON缺少 'response_text' 或 'follow_up_prompts'。");
+                }
+
+                // 添加到历史
+                addHistoryItem({ type: 'model', content: jsonResponse });
+                // 渲染到UI
+                addMessageToUI(jsonResponse, 'model');
+                // 渲染新的反问按钮
+                currentFollowUps = jsonResponse.follow_up_prompts;
+                renderFollowUpButtons(currentFollowUps, true);
+
+            } catch (parseError) { 
+                handleError("JSON 解析失败", rawText, parseError); 
+            }
+        } catch (error) { 
+            handleError('调用 Gemini API 时出错', null, error); 
+        } finally { 
+            setLoading(false); 
+        }
+    }
+    
+    // --- 交互处理 (已重写) ---
+    function handleFollowUpClick(promptText) {
+        if (isLoading) return;
+        
+        // 1. 将用户的选择添加到历史
+        addHistoryItem({ type: 'user', content: promptText });
+        
+        // 2. 将用户的选择渲染到UI
+        addMessageToUI(promptText, 'user');
+        
+        // 3. 清空并禁用按钮
+        currentFollowUps = [];
+        renderFollowUpButtons([], false); // 禁用并清空
+        
+        // 4. 获取大师的新回复
+        fetchMasterResponse(promptText);
+    }
+    
+    // --- 历史和主题管理 (已简化) ---
+    function switchTopic(topic, forceNew = false) {
+        currentTopic = topic;
+        localStorage.setItem('masterLastTopic', topic); // 使用新的 key
+        renderChatInterface(); // 渲染聊天界面
+        currentFollowUps = [];
+        
+        if (allHistories[currentTopic] && !forceNew) {
+            loadChatFromHistory();
+        } else {
+            // 创建新的历史
+            if (!allHistories[currentTopic] || forceNew) {
+                allHistories[currentTopic] = { 
+                    history: [],
+                    pinned: allHistories[currentTopic]?.pinned || false // 保留固定状态
+                };
+            }
+            saveAllHistories();
+            // 将主题作为第一个问题发送
+            handleFollowUpClick(currentTopic);
+        }
+        renderHistoryList();
+        if (sidebar.classList.contains('translate-x-0')) {
+           toggleSidebar();
+        }
+    }
+    
+    function loadChatFromHistory() {
+        const topicData = allHistories[currentTopic] || { history: [] };
+        const history = topicData.history;
+        const chatMessagesEl = document.getElementById('chat-messages');
+        if (!chatMessagesEl) return;
+        chatMessagesEl.innerHTML = '';
+        
+        let lastModelItem = null;
+        
+        history.forEach((item, index) => {
+            if (item.type === 'model') {
+                addMessageToUI(item.content, 'model');
+                lastModelItem = item;
+            } else if (item.type === 'user') {
+                addMessageToUI(item.content, 'user');
+            }
+            // 移除了 feedback 逻辑
+        });
+        
+        if (lastModelItem) {
+            // 恢复上一轮的反问按钮
+            currentFollowUps = lastModelItem.content.follow_up_prompts || [];
+            renderFollowUpButtons(currentFollowUps, true);
+        } else {
+            // 如果历史为空，自动开始
+            handleFollowUpClick(currentTopic);
+        }
+    }
+
+    function addHistoryItem(item) {
+        if (!allHistories[currentTopic]) allHistories[currentTopic] = { history: [], pinned: false };
+        allHistories[currentTopic].history.push(item);
+        saveAllHistories();
+    }
+
+    function loadAllHistories() {
+        const stored = localStorage.getItem('masterAllHistories'); // 新的 key
+        allHistories = stored ? JSON.parse(stored) : {};
+    }
+
+    function saveAllHistories() {
+        localStorage.setItem('masterAllHistories', JSON.stringify(allHistories)); // 新的 key
+        renderHistoryList();
+    }
+
+    function renderHistoryList() {
+        const historyListEl = document.getElementById('history-list');
+        if (!historyListEl) return;
+        historyListEl.innerHTML = '';
+        const topics = Object.keys(allHistories);
+        
+        // 排序 (固定 > 字母)
+        const sortedTopics = topics.sort((a, b) => {
+            const aIsPinned = (allHistories[a] && allHistories[a].pinned);
+            const bIsPinned = (allHistories[b] && allHistories[b].pinned);
+            if (aIsPinned && !bIsPinned) return -1;
+            if (!aIsPinned && bIsPinned) return 1;
+            return a.localeCompare(b);
+        });
+
+        if (sortedTopics.length === 0) {
+            historyListEl.innerHTML = `<p class="p-4 text-sm text-gray-500">还没有对话记录。</p>`;
+            return;
+        }
+
+        sortedTopics.forEach(topic => {
+            const isPinned = (allHistories[topic] && allHistories[topic].pinned);
+            const wrapper = document.createElement('div');
+            wrapper.className = `group flex items-center justify-between p-3 text-sm rounded-md ${topic === currentTopic ? 'bg-blue-600 text-white font-bold' : 'hover:bg-gray-700'}`;
+            const link = document.createElement('a');
+            link.href = "#";
+            link.className = 'truncate flex-1';
+            link.textContent = isPinned ? `📌 ${topic}` : topic;
+            link.onclick = (e) => { e.preventDefault(); switchTopic(topic); };
+            
+            const menuButton = document.createElement('button');
+            menuButton.className = 'context-menu-parent opacity-0 group-hover:opacity-100 transition-opacity ml-2 p-1 rounded-full hover:bg-gray-600';
+            menuButton.innerHTML = `<svg class="h-4 w-4 pointer-events-none" fill="currentColor" viewBox="0 0 20 20"><path d="M10 6a2 2 0 110-4 2 2 0 010 4zM10 12a2 2 0 110-4 2 2 0 010 4zM10 18a2 2 0 110-4 2 2 0 010 4z"></path></svg>`;
+            menuButton.onclick = (e) => { e.stopPropagation(); showContextMenu(e.currentTarget, topic); };
+            
+            wrapper.appendChild(link);
+            wrapper.appendChild(menuButton);
+            historyListEl.appendChild(wrapper);
+        });
+    }
+    
+    // 右键菜单 (移除错题)
+    function showContextMenu(button, topic) {
+        closeContextMenu(); 
+        const rect = button.getBoundingClientRect();
+        const menu = document.createElement('div');
+        menu.id = 'context-menu';
+        menu.className = 'context-menu w-48 bg-gray-800 border border-gray-700 rounded-md shadow-lg py-1';
+        menu.style.display = 'block';
+        menu.style.top = `${rect.bottom}px`;
+        menu.style.left = `${rect.left - 192}px`; // 调整位置
+
+        const isPinned = (allHistories[topic] && allHistories[topic].pinned);
+        const pinOption = document.createElement('a');
+        pinOption.href = '#';
+        pinOption.textContent = isPinned ? '取消固定' : '固定';
+        pinOption.className = 'block px-4 py-2 text-sm hover:bg-gray-700';
+        pinOption.onclick = (e) => { e.preventDefault(); togglePin(topic); closeContextMenu(); };
+        
+        // 移除了错题卡片选项
+
+        const deleteHistoryOption = document.createElement('a');
+        deleteHistoryOption.href = '#';
+        deleteHistoryOption.textContent = '清空对话';
+        deleteHistoryOption.className = 'block px-4 py-2 text-sm hover:bg-gray-700';
+        deleteHistoryOption.onclick = (e) => { e.preventDefault(); deleteHistoryOnly(topic); closeContextMenu(); };
+        
+        const deleteCompletelyOption = document.createElement('a');
+        deleteCompletelyOption.href = '#';
+        deleteCompletelyOption.textContent = '彻底删除';
+        deleteCompletelyOption.className = 'block px-4 py-2 text-sm text-red-400 hover:bg-red-900/50';
+        deleteCompletelyOption.onclick = (e) => { e.preventDefault(); deleteTopicCompletely(topic); closeContextMenu(); };
+
+        menu.appendChild(pinOption);
+        menu.appendChild(deleteHistoryOption);
+        menu.appendChild(document.createElement('hr')).className = 'border-gray-700 my-1';
+        menu.appendChild(deleteCompletelyOption);
+        
+        document.body.appendChild(menu);
+    }
+
+    function closeContextMenu() {
+        const menu = document.getElementById('context-menu');
+        if (menu) menu.remove();
+    }
+    
+    function togglePin(topic) {
+        if (!allHistories[topic]) return;
+        allHistories[topic].pinned = !allHistories[topic].pinned;
+        saveAllHistories();
+    }
+
+    function deleteHistoryOnly(topic) {
+        if (confirm(`确定要清空主题 "${topic}" 的对话历史吗？`)) {
+            if (allHistories[topic]) {
+                allHistories[topic].history = [];
+                saveAllHistories();
+                if (topic === currentTopic) {
+                    switchTopic(topic, true); // 重新开始当前主题
+                }
+            }
+        }
+    }
+    
+    function deleteTopicCompletely(topic) {
+        if (confirm(`警告：确定要彻底删除主题 "${topic}" 吗？\n所有对话历史都将被永久删除！`)) {
+            delete allHistories[topic];
+            saveAllHistories();
+            if (topic === currentTopic) {
+                // 切换到第一个可用主题，或默认主题
+                switchTopic(Object.keys(allHistories)[0] || '量子力学', true);
+            } else {
+                renderHistoryList();
+            }
+        }
+    }
+    
+    function clearAllHistory() {
+        if (confirm('确定要清除所有对话历史吗？此操作无法撤销。')) {
+            allHistories = {};
+            currentFollowUps = [];
+            localStorage.removeItem('masterAllHistories');
+            switchTopic('量子力学', true);
+        }
+    }
+
+    function loadApiKey() { 
+        const savedKey = localStorage.getItem('geminiApiKey'); 
+        if (savedKey) { 
+            apiKey = savedKey; 
+            return true; 
+        } 
+        return false; 
+    }
+    
+    function setLoading(loadingState) { 
+        isLoading = loadingState; 
+        const spinner = document.getElementById('loading-spinner');
+        if (spinner) spinner.classList.toggle('hidden', !loadingState);
+        // 渲染按钮时会检查 isLoading 状态
+        renderFollowUpButtons(currentFollowUps, !loadingState); 
+    }
+    
+    // 渲染反问按钮 (已重写)
+    function renderFollowUpButtons(prompts = [], enabled) { 
+        const optionsContainerEl = document.getElementById('options-container');
+        if (!optionsContainerEl) return;
+        optionsContainerEl.innerHTML = ''; // 清空
+        
+        if (prompts.length > 0) {
+            prompts.forEach((promptText) => { 
+                const button = document.createElement('button');
+                button.className = 'follow-up-btn w-full';
+                button.dataset.prompt = promptText;
+                button.disabled = !enabled;
+                button.textContent = promptText;
+                optionsContainerEl.appendChild(button);
+            });
+        }
+    }
+
+    // 渲染消息到 UI (已简化)
+    function addMessageToUI(content, role) {
+        const chatMessagesEl = document.getElementById('chat-messages');
+        if (!chatMessagesEl) return;
+        const wrapper = document.createElement('div');
+        
+        if (role === 'model') {
+            wrapper.classList.add('chat-bubble', 'model');
+            // 将换行符 \n 替换为 <br>，以便在HTML中正确显示
+            const formattedText = content.response_text.replace(/\n/g, '<br>');
+            wrapper.innerHTML = formattedText;
+        } else { // user
+            wrapper.classList.add('chat-bubble', 'user');
+            wrapper.textContent = content;
+        }
+        
+        chatMessagesEl.appendChild(wrapper);
+        // 自动滚动到底部
+        chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+    }
+    
+    // 错误处理 (保留)
+    function handleError(title, rawText, error) {
+        console.error(title, error, rawText);
+        setLoading(false); // 确保停止加载
+        const chatMessagesEl = document.getElementById('chat-messages');
+        if (!chatMessagesEl) return;
+        const errorContent = `<p><strong>抱歉，出错了</strong></p><p>${error.message}</p>${rawText ? `<p><small>原始数据: ${rawText}</small></p>` : ''}<p>请检查您的 API Key 或网络连接，然后尝试新对话。</p>`;
+        const wrapper = document.createElement('div');
+        wrapper.className = 'chat-bubble model bg-red-900/50 border border-red-500';
+        wrapper.innerHTML = errorContent;
+        chatMessagesEl.appendChild(wrapper);
+        chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+        // 禁用反问按钮
+        renderFollowUpButtons([], false);
+    }
+
+    // --- 移除了所有错题本/卡片相关的函数 ---
+    // toggleWrongQuestion (removed)
+    // startFlashcardReview (removed)
+    // renderFlashcardInterface (removed)
+
+</script>
+</body>
+</html>
